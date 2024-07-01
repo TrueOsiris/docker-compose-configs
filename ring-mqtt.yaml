@@ -1,0 +1,153 @@
+x-volume-localtime:
+  &etclocaltime
+  type: 'bind'
+  source: /etc/localtime
+  target: /etc/localtime
+  read_only: true
+x-volume-ringmqtt:
+  &ringmqtt
+  type: 'bind'
+  source: /mnt/user/docker_compose/domo/ring-mqtt
+  target: /data
+  bind:
+    create_host_path: true      
+x-volume-mosquitto-mqtt-config:
+  &mosquitto-mqtt-config
+  type: 'bind'
+  source: /mnt/user/docker_compose/domo/mosquitto-mqtt/config
+  target: /mosquitto/config
+  bind:
+    create_host_path: true
+x-volume-mosquitto-mqtt-data:
+  &mosquitto-mqtt-data
+  type: 'bind'
+  source: /mnt/user/docker_volumes/domo/mosquitto-mqtt/data
+  target: /mosquitto/data
+  bind:
+    create_host_path: true
+x-volume-mosquitto-mqtt-log:
+  &mosquitto-mqtt-log
+  type: 'bind'
+  source: /mnt/user/docker_volumes/domo/mosquitto-mqtt/log
+  target: /mosquitto/log
+  bind:
+    create_host_path: true  
+
+
+services:
+
+  mosquitto-mqtt:
+    image: eclipse-mosquitto:latest
+    labels:
+      net.unraid.docker.icon: "https://timmer.ninja/images/ico/mqtt.ico" 
+    env_file:
+      - ./.env      
+    environment:
+      DEFAULT_CONFIG: |-
+        allow_anonymous false
+        listener 1883
+        listener 9001
+        protocol websockets
+        persistence true
+        password_file /mosquitto/config/pwfile
+        persistence_file mosquitto.db
+        persistence_location /mosquitto/data/
+    command: 
+      - /bin/sh
+      - -c
+      - |
+        cf="/mosquitto/config/mosquitto.conf"
+        pf="/mosquitto/config/pwfile"
+        if [ ! -f $$cf ]; then
+          echo "> Creating config file $$cf"
+          echo -n "$$CONFIG_CONTENT" > $$cf
+        else
+          echo "> Found config file $$cf"
+        fi
+        cat $$cf
+        echo " "
+        if [ ! -f $$pf ]; then
+          echo "> Creating password file"
+          touch $$pf
+          chown mosquitto:mosquitto $$pf
+          chmod 600 $$pf
+        fi
+        /usr/bin/mosquitto_passwd -b $$pf $$MQTTADMIN $$MQTTADMINPASS
+        echo "> Running Eclipse-Mosquitto MQTT"
+        /usr/sbin/mosquitto -c $$cf
+    ports:
+      - 1883:1883 #default mqtt port
+      - 9001:9001 #default mqtt port for websockets
+    volumes:
+      - <<: *etclocaltime
+      - <<: *mosquitto-mqtt-config
+      - <<: *mosquitto-mqtt-data
+      - <<: *mosquitto-mqtt-log
+    logging: 
+      options:
+        max-size: "10m"
+        max-file: "3"      
+    healthcheck:
+      test: mosquitto_sub -u $$MQTTADMIN -P $$MQTTADMINPASS -t '$$SYS/#' -C 1 -i healthcheck -W 3
+      interval: 20s
+      timeout: 10s
+      retries: 3     
+    restart: unless-stopped      
+    network_mode: bridge
+     
+
+  ring-mqtt:
+    image: tsightler/ring-mqtt:latest
+    labels:
+      net.unraid.docker.icon: "https://timmer.ninja/images/ico/mqtt.ico"    
+    env_file:
+      - ./.env  # set variables MQTTHOST, MQTTPORT, MQTTADMIN, MQTTADMINPASS, RINGMQTTLIVESTREAMUSER, RINGMQTTLIVESTREAMPASS
+    ports:
+      - 8554:8554  # Enable RTSP port for external media player access
+      - 55123:55123
+    environment:
+      TZ: Europe/Brussels
+      D_CONFIG: |-
+        {
+          \"mqtt_url\": \"mqtt://$${MQTTADMIN}:$${MQTTADMINPASS}@$${MQTTHOST}:$${MQTTPORT}\",
+          \"mqtt_options\": \"\",
+          \"livestream_user\": \"$${RINGMQTTLIVESTREAMUSER}\",
+          \"livestream_pass\": \"$${RINGMQTTLIVESTREAMPASS}\",
+          \"disarm_code\": \"\",
+          \"enable_cameras\": true,
+          \"enable_modes\": false,
+          \"enable_panic\": false,
+          \"hass_topic\": \"homeassistant/status\",
+          \"ring_topic\": \"ring\",
+          \"location_ids\": []
+        }
+    entrypoint: >
+      /bin/sh -c '
+        url_encode() {
+          echo -n "$1" | jq -sRr @uri
+        }
+        cf="/data/config.json"
+        encoded_mqttadmin=$(url_encode "$${MQTTADMIN}")
+        encoded_mqttadminpass=$(url_encode "$${MQTTADMINPASS}")
+        D_CONFIG=$(echo "$${D_CONFIG}" | sed -e "s/\$${MQTTADMIN}/$${encoded_mqttadmin}/" -e "s/\$${MQTTADMINPASS}/$${encoded_mqttadminpass}/")
+        eval "echo -n \"$$D_CONFIG\"" > $$cf
+        exec /init
+      '
+    depends_on:
+      mosquitto-mqtt:
+        condition: service_healthy  
+    volumes:
+      - <<: *etclocaltime
+      - <<: *ringmqtt
+    logging: 
+      options:
+        max-size: "10m"
+        max-file: "3"
+    restart: unless-stopped
+    network_mode: bridge  
+    healthcheck:
+      test: ["CMD-SHELL", "if [ -f /data/ring-state.json ]; then exit 0; else exit 1; fi"]
+      interval: 15s
+      timeout: 10s
+      retries: 4
+      start_period: 30s
